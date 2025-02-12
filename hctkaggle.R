@@ -139,22 +139,28 @@ recipe_boost <- recipe(hct_survival ~ ., data=training_set) %>%
     step_impute_knn(all_numeric_predictors()) %>%
     step_novel(all_nominal_predictors()) %>%
     step_other(all_nominal_predictors(),threshold=.02) %>%
-    step_zv(all_predictors()) 
+    step_zv(all_predictors())
 recipe_cox <- recipe(hct_survival ~ ., data=training_set) %>%
     update_role(ID,new_role = "ID") %>%
     step_impute_knn(all_numeric_predictors()) %>%
     step_novel(all_nominal_predictors()) %>%
     step_other(all_nominal_predictors(),threshold=.02) %>%
+    step_dummy(all_nominal_predictors()) %>%  
     step_zv(all_predictors()) %>%
-    step_normalize(all_numeric_predictors()) %>%
-    step_dummy(all_nominal_predictors(),-race_group,-sex_match,-ethnicity) 
-recipe_cox_trained <- prep(recipe_cox)
-recipe_cox_pca <- recipe_cox_trained %>% step_pca(all_numeric_predictors(),num_comp = 12) %>%
-    prep()
+    step_normalize(all_numeric_predictors()) ## Normalize the dummy variables
 
-rcbaked <- recipe_cox_trained %>% bake(training(splits)) %>% glimpse()
+recipe_cox_prepca <- recipe(hct_survival ~ ., data=training_set) %>%
+    update_role(ID,new_role = "ID") %>%
+    step_impute_knn(all_numeric_predictors()) %>%
+    step_novel(all_nominal_predictors()) %>%
+    step_other(all_nominal_predictors(),threshold=.02) %>%
+    step_dummy(all_nominal_predictors(),-race_group,-sex_match,-ethnicity) %>%  ## Hold 3 nominal predictors out
+    step_zv(all_predictors()) %>%
+    step_normalize(all_numeric_predictors()) ## Normalize the dummy variables
+recipe_cox_pca <- recipe_cox_prepca %>% step_pca(all_numeric_predictors(),num_comp = 20) %>% step_dummy(race_group,sex_match,ethnicity)
 
-tidied <- tidy(recipe_cox_pca,7)
+recipe_cox_pca_trained <- prep(recipe_cox_pca)
+tidied <- tidy(recipe_cox_pca_trained,7)
 tidied %>%
   filter(component %in% paste0("PC", 1:12)) %>%
   group_by(component) %>%
@@ -163,31 +169,30 @@ tidied %>%
   mutate(terms = reorder_within(terms, abs(value), component)) %>%
   ggplot(aes(abs(value), terms, fill = value > 0)) +
   geom_col() +
-  facet_wrap(~component, scales = "free_y") +
+  facet_wrap(~component, ncol=1,scales = "free_y") +
   scale_y_reordered() +
   labs(
     x = "Absolute value of contribution",
     y = NULL, fill = "Positive?"
   )
-recipe_cox_pca <- recipe_cox %>% step_pca(all_numeric_predictors(),num_comp = 12)
 
 ## Specify the candidate models
-cox_spec <- boost_tree(mtry=5,min_n=tune(),trees=tune(),tree_depth = tune(),loss_reduction = .001) %>%
+cox_spec <- boost_tree(mtry=5,min_n=tune(),trees=tune(),tree_depth = tune(),loss_reduction = .1) %>%
     set_engine('mboost') %>% set_mode('censored regression')
-weibull_spec <- boost_tree(mtry=25,min_n=tune(),trees=tune(),tree_depth = tune(),loss_reduction = .01) %>%
+weibull_spec <- boost_tree(mtry=25,min_n=tune(),trees=tune(),tree_depth = tune(),loss_reduction = .11) %>%
     set_engine('mboost',family=Weibull()) %>%  set_mode('censored regression')
-lognormal_spec <- boost_tree(mtry=25,min_n=tune(),trees=tune(),tree_depth = tune(),loss_reduction = .01) %>%
+lognormal_spec <- boost_tree(mtry=25,min_n=tune(),trees=tune(),tree_depth = tune(),loss_reduction = .11) %>%
     set_engine('mboost',family=Lognormal()) %>%  set_mode('censored regression')
-loglog_spec <- boost_tree(mtry=25,min_n=tune(),trees=tune(),tree_depth = tune(),loss_reduction = .01) %>% 
+loglog_spec <- boost_tree(mtry=25,min_n=tune(),trees=tune(),tree_depth = tune(),loss_reduction = .1) %>% 
     set_engine('mboost',family=Loglog()) %>%  set_mode('censored regression')
 
 cox_glmnet <- proportional_hazards(penalty=tune()) %>% set_engine('glmnet') %>% set_mode('censored regression')
 
-## Set Up WorkFlow
+## Set Up the Grid
 grid <- workflow() %>%
     add_recipe(recipe_boost) %>%
     add_model(weibull_spec) %>% 
-    extract_parameter_set_dials() %>% grid_space_filling(size=6)
+    extract_parameter_set_dials() %>% grid_space_filling(size=10)
 grid_glmnet  <-  grid_regular(penalty(range= c(1e-3,.8),trans=NULL),levels=10)
 ## Tuning
 grid_ctrl <-
@@ -258,32 +263,27 @@ collect_predictions(cox_test_results)
 ## --------------------------------------------------------------------------------------------- ##
 ## Final Analyses Using Cox Model
 ## --------------------------------------------------------------------------------------------- ##
-recipe_cox_interact <- recipe_cox %>% step_interact(~ starts_with("race_group_"):all_predictors())
-
-## Final Work Flow Cox Model with Interaction Terms with Race
+## GLMNET Cox Model without Principal Components
 cox_wkflow <- workflow() %>%
     add_recipe(recipe_cox) %>%
     add_model(cox_glmnet)
-#recipe_cox_interact %>% prep() %>% juice() %>% glimpse()
 grid_ctrl <-
    control_grid(
-      save_pred = FALSE,
-      parallel_over = "resamples",
-      save_workflow = FALSE,
-      verbose=FALSE
+    save_pred = FALSE,
+    parallel_over = "resamples",
+    save_workflow = FALSE,
+    verbose=FALSE
    )
-
-## Tune GLMNET Model without interactions
-st <- Sys.time()
+st <- Sys.time();print(st)
 plan(multisession, workers=3)
-grid_cox <- grid_regular(penalty(range = c(1e-3, .10),trans=NULL),levels= 5)
+grid_cox <- grid_regular(penalty(range = c(1e-4, .10),trans=NULL),levels= 5)
 cox_results <- tune_grid(
-  cox_wkflow,
-  resamples = validate,
-  grid = grid_cox,
-  metrics = survival_metrics,
-  eval_time = evaluation_time_points,
-  control = grid_ctrl
+    cox_wkflow,
+    resamples = validate,
+    grid = grid_cox,
+    metrics = survival_metrics,
+    eval_time = evaluation_time_points,
+    control = grid_ctrl
 )
 et <- Sys.time()
 et-st
@@ -294,57 +294,19 @@ show_best(cox_results, metric = "brier_survival_integrated",n=15)
 param_best <- select_best(cox_results, metric = "concordance_survival")
 last_cox_wflow <- finalize_workflow(cox_wkflow, param_best)
 last_cox_fit <- last_fit(
-  last_cox_wflow, 
-  split = splits,
-  metrics = survival_metrics,
-  eval_time = evaluation_time_points, 
-)
+    last_cox_wflow, 
+    split = splits,
+    metrics = survival_metrics,
+    eval_time = evaluation_time_points)
 collect_metrics(last_cox_fit) %>% filter(.metric == "concordance_survival")
 last_cox_model <- extract_workflow(last_cox_fit)
 pred_censored <- predict(last_cox_model, new_data= testing(splits),type="linear_pred")
 p <- bind_cols(testing(splits),pred_censored,pred_risk = exp(pred_censored$.pred_linear_pred))
-
-glimpse(p)
+#glimpse(p)
 summary(p$pred_risk)
 
-## Tune GLMNET Model with interactions
-cox_wkflow_interact <- workflow() %>%
-    add_recipe(recipe_cox_interact) %>%
-    add_model(cox_glmnet)
-st <- Sys.time()
-plan(multisession, workers=3)
-grid_cox <- grid_regular(penalty(range = c(1e-3, .3),trans=NULL),levels= 5)
-cox_results_interact <- tune_grid(
-  cox_wkflow_interact,
-  resamples = validate,
-  grid = grid_cox,
-  metrics = survival_metrics,
-  eval_time = evaluation_time_points,
-  control = grid_ctrl
-)
-et <- Sys.time()
-et-st
-plan(sequential)
-show_best(cox_results_interact, metric = "concordance_survival", n = 15)
-show_best(cox_results_interact, metric = "brier_survival_integrated",n=15)
-param_best <- select_best(cox_results_interact, metric = "concordance_survival")
-last_cox_wflow <- finalize_workflow(cox_wkflow_interact, param_best)
-last_cox_fit <- last_fit(
-  last_cox_wflow, 
-  split = splits,
-  metrics = survival_metrics,
-  eval_time = evaluation_time_points, 
-)
-collect_metrics(last_cox_fit) %>% filter(.metric == "concordance_survival")
-last_cox_model <- extract_workflow(last_cox_fit)
-pred_censored <- predict(last_cox_model, new_data= testing(splits),type="linear_pred")
-pinteract <- bind_cols(testing(splits),pred_censored,pred_risk = exp(pred_censored$.pred_linear_pred))
-
-glimpse(pinteract)
-summary(pinteract$pred_risk)
-
-## Tune MBOOST Model with interactions
-#recipe_boost_interact <- recipe_boost %>% step_interact(~ race_group:all_predictors()) %>% step_clean_names(all_predictors())
+## GLMNET Model with Principal Components
+plan(multisession)
 grid_ctrl <-
    control_grid(
       save_pred = FALSE,
@@ -352,15 +314,13 @@ grid_ctrl <-
       save_workflow = FALSE,
       verbose=FALSE
    )
-recipe_cox_pca <- recipe_cox %>% step_pca(all_numeric_predictors(),num_comp = 12)
-cox_wkflow_boost <- workflow() %>%
+cox_wkflow <- workflow() %>%
     add_recipe(recipe_cox_pca) %>%
-    add_model(cox_spec)
-grid_cox <- cox_wkflow_boost %>% extract_parameter_set_dials %>% grid_space_filling(size=6)
+    add_model(cox_glmnet)
 st <- Sys.time(); print(st)
-plan(multisession, workers=3)
-cox_results_boost <- tune_grid(
-  cox_wkflow_boost,
+grid_cox <- grid_regular(penalty(range = c(1e-4, .10),trans=NULL),levels= 5)
+cox_results <- tune_grid(
+  cox_wkflow,
   resamples = validate,
   grid = grid_cox,
   metrics = survival_metrics,
@@ -369,27 +329,109 @@ cox_results_boost <- tune_grid(
 )
 et <- Sys.time()
 et-st
-plan(sequential)
-show_best(cox_results_boost, metric = "concordance_survival", n = 15)
-show_best(cox_results_boost, metric = "brier_survival_integrated",n=15)
-
-## Last Fit (With Interactions)
-param_best <- select_best(cox_results_interact, metric = "concordance_survival")
-last_cox_wflow <- finalize_workflow(cox_wkflow_interact_boost, param_best)
-last_cox_fit_interact <- last_fit(
-    last_cox_wflow,
-    
+show_best(cox_results, metric = "concordance_survival", n = 15)
+show_best(cox_results, metric = "brier_survival_integrated",n=15)
+param_best <- select_best(cox_results, metric = "concordance_survival")
+last_cox_wflow <- finalize_workflow(cox_wkflow, param_best)
+last_cox_fit <- last_fit(
+  last_cox_wflow,
   split = splits,
   metrics = survival_metrics,
-  eval_time = evaluation_time_points, 
-)
-collect_metrics(last_cox_fit_interact) %>% filter(.metric == "concordance_survival")
-last_cox_model <- extract_workflow(last_cox_fit_interact)
-pred_censored_interact <- predict(last_cox_model, new_data= testing(splits),type="linear_pred")
-pboost <- bind_cols(testing(splits),pred_censored_interact,pred_risk_interact = exp(pred_censored_interact$.pred_linear_pred))
+  eval_time = evaluation_time_points)
+collect_metrics(last_cox_fit) %>% filter(.metric == "concordance_survival")
+last_cox_model <- extract_workflow(last_cox_fit)
+pred_censored <- predict(last_cox_model, new_data= testing(splits),type="linear_pred")
+ppca <- bind_cols(testing(splits),pred_censored,pred_risk = exp(pred_censored$.pred_linear_pred))
+#glimpse(p)
+summary(ppca$pred_risk)
 
-glimpse(pboost)
-summary(pboost$pred_risk)
+## Tune GLMNET Model with Principal Components and Interactions
+plan(multisession)
+grid_ctrl <-
+    control_grid(
+        save_pred = FALSE,
+        parallel_over = "resamples",
+        save_workflow = FALSE,
+        verbose=FALSE)
+recipe_cox_pcainteract <- recipe_cox_pca %>% step_interact(~ starts_with("race_group"):starts_with("PC")) %>%
+    step_interact(~ starts_with("sex_match"):starts_with("PC")) %>%
+    step_interact(~ starts_with("ethnicity"):starts_with("PC"))
+cox_wkflow_interact <- workflow() %>%
+    add_recipe(recipe_cox_pcainteract) %>%
+    add_model(cox_glmnet)
+st <- Sys.time(); print(st)
+grid_cox <- grid_regular(penalty(range = c(1e-4, .10),trans=NULL),levels= 5)
+cox_results_interact <- tune_grid(
+    cox_wkflow_interact,
+    resamples = validate,
+    grid = grid_cox,
+    metrics = survival_metrics,
+    eval_time = evaluation_time_points,
+    control = grid_ctrl)
+et <- Sys.time()
+et-st
+show_best(cox_results_interact, metric = "concordance_survival", n = 15)
+show_best(cox_results_interact, metric = "brier_survival_integrated",n=15)
+param_best <- select_best(cox_results_interact, metric = "concordance_survival")
+last_cox_wflow <- finalize_workflow(cox_wkflow_interact, param_best)
+last_cox_fit <- last_fit(
+    last_cox_wflow,
+    split = splits,
+    metrics = survival_metrics,
+    eval_time = evaluation_time_points)
+collect_metrics(last_cox_fit) %>% filter(.metric == "concordance_survival")
+last_cox_model <- extract_workflow(last_cox_fit)
+pred_censored <- predict(last_cox_model, new_data= testing(splits),type="linear_pred")
+pinteract <- bind_cols(testing(splits),pred_censored,pred_risk = exp(pred_censored$.pred_linear_pred))
+#glimpse(pinteract)
+summary(pinteract$pred_risk)
+
+## Tune Mboost Cox Model with principal components
+plan(multisession)
+grid_ctrl <-
+   control_grid(
+      save_pred = FALSE,
+      parallel_over = "resamples",
+      save_workflow = FALSE,
+      verbose=FALSE
+   )
+cox_wkflow <- workflow() %>%
+    add_recipe(recipe_cox_pca) %>%
+    add_model(cox_spec)
+st <- Sys.time(); print(st)
+grid_cox <- cox_wkflow %>% extract_parameter_set_dials %>% grid_space_filling(size=12)
+#print(grid_cox)
+cox_results <- tune_grid(
+  cox_wkflow,
+  resamples = validate,
+  grid = grid_cox,
+  metrics = survival_metrics,
+  eval_time = evaluation_time_points,
+  control = grid_ctrl
+)
+et <- Sys.time()
+et-st
+show_best(cox_results, metric = "concordance_survival", n = 15)
+show_best(cox_results, metric = "brier_survival_integrated",n=15)
+param_best <- select_best(cox_results, metric = "concordance_survival")
+last_cox_wflow <- finalize_workflow(cox_wkflow, param_best)
+last_cox_fit <- last_fit(
+  last_cox_wflow,
+  split = splits,
+  metrics = survival_metrics,
+  eval_time = evaluation_time_points
+)
+collect_metrics(last_cox_fit) %>% filter(.metric == "concordance_survival")
+last_cox_model <- extract_workflow(last_cox_fit)
+pred_censored <- predict(last_cox_model, new_data= testing(splits),type="linear_pred")
+p <- bind_cols(testing(splits),pred_censored,pred_risk = exp(pred_censored$.pred_linear_pred))
+#glimpse(p)
+summary(p$pred_risk)
+
+
+
+
+
 
 
 ## Plot Risk Scores
