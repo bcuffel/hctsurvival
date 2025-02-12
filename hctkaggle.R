@@ -358,7 +358,7 @@ recipe_cox_pcainteract <- recipe_cox_pca %>% step_interact(~ starts_with("race_g
     step_interact(~ starts_with("ethnicity"):starts_with("PC"))
 cox_wkflow_interact <- workflow() %>%
     add_recipe(recipe_cox_pcainteract) %>%
-    add_model(cox_glmnet)
+    add_model(cox_spec)
 st <- Sys.time(); print(st)
 grid_cox <- grid_regular(penalty(range = c(1e-4, .10),trans=NULL),levels= 5)
 cox_results_interact <- tune_grid(
@@ -385,6 +385,8 @@ pred_censored <- predict(last_cox_model, new_data= testing(splits),type="linear_
 pinteract <- bind_cols(testing(splits),pred_censored,pred_risk = exp(pred_censored$.pred_linear_pred))
 #glimpse(pinteract)
 summary(pinteract$pred_risk)
+
+
 
 ## Tune Mboost Cox Model with principal components
 plan(multisession)
@@ -427,12 +429,6 @@ pred_censored <- predict(last_cox_model, new_data= testing(splits),type="linear_
 p <- bind_cols(testing(splits),pred_censored,pred_risk = exp(pred_censored$.pred_linear_pred))
 #glimpse(p)
 summary(p$pred_risk)
-
-
-
-
-
-
 
 ## Plot Risk Scores
 
