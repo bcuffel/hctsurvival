@@ -81,86 +81,69 @@ cv = vfold_cv(v = 5,data=training_set)
 ## Preprocessing 
 ##-----------------------------------------------------------------------------------------------##
 recipe_umap <- recipe(hct_survival ~ ., data=training_set) %>%
-  update_role(risk_group, new_role = "id") %>%  # Mark risk_group as non-predictor
-  update_role_requirements(role = "id", bake = FALSE) %>%  # Ensure it's not needed for new data
     step_impute_knn(all_predictors()) %>%
     step_novel(all_nominal_predictors()) %>%
     step_other(all_nominal_predictors(),threshold=.02) %>%
     step_dummy(all_nominal_predictors(),-risk_group) %>%  
     step_zv(all_predictors()) %>%
-    step_umap(all_numeric_predictors(), outcome = vars(risk_group), num_comp = tune()) %>%
-    step_normalize(all_numeric_predictors())    ## Normalize the dummy variables
+    step_normalize(all_numeric_predictors()) %>% ## Normalize the dummy variables
+    step_umap(all_numeric_predictors(), outcome = vars(risk_group), num_comp = 5)
 
 ## --------------------------------------------------------------------------------------------- ##
 ## Model Specification 
 ## --------------------------------------------------------------------------------------------- ##
-cox_spec <- boost_tree(mtry=5,min_n=40,trees=tune(),tree_depth = tune(),loss_reduction = .1) %>%
+cox_spec <- boost_tree(mtry=5,min_n=40,trees=2000,tree_depth = 8,loss_reduction = .1) %>%
     set_engine('mboost') %>% set_mode('censored regression')
-
 ## --------------------------------------------------------------------------------------------- ##
 ## Workflow for the Model with UMAP dimensionality Reduction and Resampling
 ## --------------------------------------------------------------------------------------------- ##
 cox_wkflow <- workflow() %>%
     add_recipe(recipe_umap) %>%
     add_model(cox_spec)
-grid_cox <- cox_wkflow %>% extract_parameter_set_dials() %>% grid_space_filling(size=5)
 ## --------------------------------------------------------------------------------------------- ##
 ## Resampling / Cross Validation 
 ## --------------------------------------------------------------------------------------------- ##
-st <- Sys.time();print(st)
-plan(multisession, workers=3)
-comment <- function() {
+## Mboost Model with UMAP
+plan(multisession)
+cox_wkflow <- workflow() %>%
+    add_recipe(recipe_umap) %>%
+    add_model(cox_spec)
+st <- Sys.time(); print(st)
 cox_results <- cox_wkflow %>%
   fit_resamples(
     resamples = validate,
     metrics = metric_set(concordance_survival),
     control = control_resamples(save_pred = TRUE)
   )
-}
-
-
-
-cox_results <- tune_grid(
-    cox_wkflow,
-    resamples = validate, 
-    grid = grid_cox,
-    metrics = survival_metrics,
-    eval_time = evaluation_time_points,
-    control = control_race()
-)
-
 et <- Sys.time()
 et-st
-plan(sequential)
 collect_metrics(cox_results)
-## --------------------------------------------------------------------------------------------- ##
-## Workflow for the Model with UMAP dimensionality Reduction and Resampling
-## --------------------------------------------------------------------------------------------- ##
-# param_best <- select_best(cox_results, metric = "concordance_survival")
 
-## Finalize workflow containing the best parameters
-#last_cox_wflow <- finalize_workflow(cox_wkflow, param_best)
-
-# Fit the model directly on training data
+## --------------------------------------------------------------------------------------------- ##
+## Fit a final workflow that allows for prediction (removing risk_group) 
+## --------------------------------------------------------------------------------------------- ##
 last_surv_fit <- fit(cox_wkflow, data = training_set)
+last_surv_fit %>%
+    extract_mold() %>%
+    pluck("predictors") %>%
+    colnames()
+# Extract trained recipe
+final_recipe <- last_surv_fit %>% extract_preprocessor() 
+final_recipe <- final_recipe %>%
+  update_role(risk_group, new_role = "id") %>%  # Mark as non-predictor
+  update_role_requirements(role = "id", bake = FALSE)  # Ensure it is ignored at prediction time
 
-# Verify that the model now expects UMAP embeddings
-expected_features <- last_surv_fit %>%
-  extract_mold() %>%
-  pluck("predictors") %>%
-  colnames()
-print(expected_features)  # Should output: "UMAP1", "UMAP2", "UMAP3", "UMAP4", "UMAP5"
+# Create a new workflow with the updated recipe
+final_workflow <- workflow() %>%
+  add_recipe(final_recipe) %>%
+  add_model(cox_spec)  # Use the same boosting model
 
-# ------------------------------------
+# Fit the updated workflow to training data
+last_surv_fit <- fit(final_workflow, data = training_set)
+
+## --------------------------------------------------------------------------------------------- ##
 # Apply the Trained Model to New Data
-# ------------------------------------
-# Use the trained workflow directly for prediction
+## --------------------------------------------------------------------------------------------- ##
 pred_submission <- predict(last_surv_fit, d1, type = "linear_pred")
-write.csv(file = file.path(path,"submission.csv"),x = pred_submission)
-
-## Plot Risk Scores
-
-cbind(predict_cox = p$pred_risk,predict_boost = pboost$pred_risk,predict_cox_interact=pinteract$pred_risk) %>%
-    ggplot(aes(x=predict_cox) +
-           geom_point(aes(y=predict_boost),colour = mckinsey[1],alpha=.5)
-           geom_point(aes(y=predict_boost),colour = mckinsey[2],alpha=.5)
+head(pred_submission)
+write.csv(pred_submission,"submission.csv",row.names=FALSE)

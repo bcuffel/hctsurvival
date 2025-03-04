@@ -6,9 +6,11 @@ library(future)
 library(furrr)
 tidymodels_prefer()
 
-d <- ovarian
-d <- d %>% mutate(ovarian_survival = Surv(futime, fustat == 1), 
+d <- lung
+d <- d %>% mutate(cancer_survival = Surv(time, status == 2), 
     .keep = "unused")
+d
+
 
 ##----------------------------------------------------------------------------------------------------------##
 ## Machine Learning with Mboost
@@ -21,59 +23,66 @@ train_set <- training(splits)
 survival_metrics <- metric_set(brier_survival_integrated, brier_survival,
                                roc_auc_survival, concordance_survival)
 evaluation_time_points <- seq(0, 1000,100)
-
+cv <- vfold_cv(d,v = 10)
 ## Model specifications
-spec <- survival_reg(dist = tune()) %>% set_engine("survival") %>% set_mode("censored regression")
 cox_glmnet <-   proportional_hazards(penalty=tune()) %>% set_engine('glmnet') %>% set_mode('censored regression')
-cox_spec <-     boost_tree(mtry=tune(),min_n=tune(),trees=tune(),tree_depth=tune(),loss_reduction=tune())  %>% 
-                set_engine('mboost') %>% set_mode('censored regression')
-weibull_spec <- boost_tree(mtry=tune(),min_n=tune(),trees=tune(),tree_depth=tune(),loss_reduction=tune()) %>% 
+cox_spec <-     boost_tree(mtry=4,min_n=tune(),trees=tune(),tree_depth=tune(),loss_reduction=.01)  %>% 
+    set_engine('mboost') %>% set_mode('censored regression')
+cox_spec2 <-     boost_tree() %>% set_engine('mboost') %>% set_mode('censored regression')
+
+weibull_spec <- boost_tree(mtry=4,min_n=tune(),trees=tune(),tree_depth=tune(),loss_reduction=.01) %>% 
                 set_engine('mboost',family=Weibull()) %>%
                 set_mode('censored regression')
-lognormal_spec <- boost_tree(mtry=tune(),min_n=tune(),trees=tune(),tree_depth=tune(),loss_reduction=tune()) %>% 
+lognormal_spec <- boost_tree(mtry=4,min_n=tune(),trees=tune(),tree_depth=tune(),loss_reduction=.01) %>% 
                   set_engine('mboost',family=Lognormal()) %>%  set_mode('censored regression')
-loglog_spec <-    boost_tree(mtry=tune(),min_n=tune(),trees=tune(),tree_depth=tune(),loss_reduction=tune()) %>% 
+loglog_spec <-    boost_tree(mtry=4,min_n=tune(),trees=tune(),tree_depth=tune(),loss_reduction=.01) %>% 
                   set_engine('mboost',family=Loglog()) %>%  set_mode('censored regression')
 
 ## Preprocessing
-recipe_other <- recipe(ovarian_survival ~ ., data = train_set)
-recipe_boost <- recipe(ovarian_survival ~ ., data=train_set) %>%
+recipe_other <- recipe(cancer_survival ~ ., data = train_set)
+recipe_boost <- recipe(cancer_survival ~ ., data=train_set) %>%
     step_impute_knn(all_numeric_predictors()) %>%
     step_novel(all_nominal_predictors()) %>%
     step_other(all_nominal_predictors(),threshold=.02) %>%
     step_zv(all_predictors()) 
-recipe_other %>% prep() %>% juice()
-recipe_boost %>% prep() %>% juice()
+trained <- recipe_boost %>% prep() %>% juice()
 
 ## Workflow
 surv_wkflow <- workflow() %>%
     add_recipe(recipe_boost) %>%
-    add_model(cox_glmnet)
-surv_wkflow <- workflow() %>%
-    add_recipe(recipe_boost) %>%
-    add_model(cox_glmnet,formula=ovarian_survival ~ . + strata(rx))
+    add_model(cox_glmnet,formula = cancer_survival ~ . + strata(sex))
+
 ## Tuning
 grid_ctrl <-
    control_grid(
-      save_pred = TRUE,
+      save_pred = FALSE,
       parallel_over = "resamples",
       save_workflow = FALSE
    )
-grid <- surv_wkflow %>% extract_parameter_set_dials() %>% finalize(train_set) %>% 
-               grid_space_filling(size = 25)
-grid_cox <- surv_wkflow %>% extract_parameter_set_dials() %>% grid_regular(levels = 10) 
-
-plan(multisession,workers=3)
-surv_results <- tune_grid(
+grid_race <-
+   control_race(
+      save_pred = FALSE,
+      parallel_over = "resamples",
+      save_workflow = FALSE,
+      verbose=FLASE
+   )
+grid <- surv_wkflow %>% extract_parameter_set_dials() %>% 
+    grid_space_filling(size = 25)
+grid_cox <- surv_wkflow %>% extract_parameter_set_dials() %>% grid_regular(levels = 10)
+plan(multisession)
+surv_results <- tune_race_anova(
   surv_wkflow,
-  resamples = validate,
+  resamples = cv,
   grid = grid_cox,
   metrics = survival_metrics,
   eval_time = evaluation_time_points,
-  control = grid_ctrl
+  control = grid_race
 )
 plan(sequential)
 collect_metrics(surv_results) %>% filter(.metric == "concordance_survival") %>% print(n=Inf)
+best_params <- select_best(surv_results, metric = "concordance_survival")
+final_wkflow <- surv_wkflow %>% finalize_workflow(best_params)
+final_fit <- final_wkflow %>% last_fit(splits,eval_time = evaluation_time_points)
 
 
 ##----------------------------------------------------------------------------------------------------------##
